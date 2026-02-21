@@ -1,0 +1,6 @@
+opencv-python
+mediapipe
+pyaudio
+numpy
+torch>=2.0.0
+librosa
