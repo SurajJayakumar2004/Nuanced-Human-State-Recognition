@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Any, Dict
 
 import numpy as np
+import torch
 import librosa
+from transformers import Wav2Vec2Model
 
 
 class AudioExpert:
@@ -17,6 +19,17 @@ class AudioExpert:
 
     def __init__(self, sample_rate: int = 16000) -> None:
         self.sample_rate = sample_rate
+        # Device: prefer MPS, then CUDA, then CPU
+        self.device = torch.device(
+            "mps"
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+            else "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+        self._wav2vec2 = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base")
+        self._wav2vec2.to(self.device)
+        self._wav2vec2.eval()
 
     def _to_float_audio(self, audio_data: np.ndarray) -> np.ndarray:
         """
@@ -108,29 +121,78 @@ class AudioExpert:
         # Clamp to a reasonable [0, 1] range for downstream fusion logic.
         return float(np.clip(jitter_ppq, 0.0, 1.0))
 
-    def extract_features(self, audio_np: np.ndarray) -> Dict[str, float]:
+    def get_latent_embeddings(self, audio_np: np.ndarray) -> np.ndarray:
         """
-        Extract normalized intensity and jitter from a 1-second 16kHz buffer.
+        Process a 1-second 16kHz chunk through Wav2Vec 2.0 and return
+        mean-pooled hidden states as a feature vector.
+
+        Args:
+            audio_np: np.ndarray of shape [T], mono 16kHz (e.g. T=16000).
+
+        Returns:
+            np.ndarray of shape (768,) dtype float32.
+        """
+        audio = self._to_float_audio(audio_np)
+        if audio.size == 0:
+            return np.zeros(768, dtype=np.float32)
+        # [T] -> [1, T]
+        tensor = torch.from_numpy(audio).float().unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            out = self._wav2vec2(tensor)
+        # last_hidden_state: [1, seq_len, 768]
+        hidden = out.last_hidden_state
+        pooled = hidden.mean(dim=1).squeeze(0).cpu().numpy().astype(np.float32)
+        return pooled
+
+    def get_latent_sequence(self, audio_np: np.ndarray, num_steps: int = 15) -> np.ndarray:
+        """
+        Return hidden states as a sequence of num_steps timesteps to align with visual.
+        Samples (or interpolates) from last_hidden_state [1, seq_len, 768] to get [num_steps, 768].
+        """
+        audio = self._to_float_audio(audio_np)
+        if audio.size == 0:
+            return np.zeros((num_steps, 768), dtype=np.float32)
+        tensor = torch.from_numpy(audio).float().unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            out = self._wav2vec2(tensor)
+        hidden = out.last_hidden_state  # [1, seq_len, 768]
+        seq_len = hidden.size(1)
+        if seq_len == 0:
+            return np.zeros((num_steps, 768), dtype=np.float32)
+        hidden = hidden.squeeze(0).cpu().numpy()  # [seq_len, 768]
+        if seq_len >= num_steps:
+            # Sample num_steps indices uniformly
+            indices = np.linspace(0, seq_len - 1, num_steps, dtype=np.int64)
+            return hidden[indices].astype(np.float32)
+        # Fewer than num_steps: interpolate (linear) to num_steps
+        x_old = np.linspace(0, 1, seq_len)
+        x_new = np.linspace(0, 1, num_steps)
+        out = np.zeros((num_steps, 768), dtype=np.float32)
+        for d in range(768):
+            out[:, d] = np.interp(x_new, x_old, hidden[:, d])
+        return out
+
+    def extract_features(self, audio_np: np.ndarray) -> Dict[str, Any]:
+        """
+        Extract normalized intensity, jitter, and Wav2Vec2 latent from a 1-second 16kHz buffer.
 
         Args:
             audio_np: np.ndarray of shape [T], mono 16kHz, typically T ~= 16000.
 
         Returns:
-            Dict[str, float]:
-                {
-                    "jitter": float in [0, 1],
-                    "intensity": float in [0, 1],
-                }
+            Dict with "jitter", "intensity" (float), and "audio_latent" (np.ndarray shape (768,)).
         """
         audio = self._to_float_audio(audio_np)
 
         intensity = self._compute_intensity(audio)
         f0_track = self._compute_f0_track(audio)
         jitter = self._compute_jitter_ppq(f0_track)
+        audio_latent = self.get_latent_embeddings(audio_np)
 
         return {
             "jitter": jitter,
             "intensity": intensity,
+            "audio_latent": audio_latent,
         }
 
 

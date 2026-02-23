@@ -1,6 +1,7 @@
 import threading
 import signal
 import time
+from collections import deque
 from typing import Optional, Dict, Any, Tuple, List
 
 import cv2
@@ -11,7 +12,7 @@ import torch
 
 from models.visual_expert import VisualExpert
 from models.audio_expert import AudioExpert
-from models.fusion_head import NuancedStateClassifier
+from models.fusion_head import NuancedStateClassifier, SEQ_LEN
 from utils.fusion import classify_nuanced_state
 
 
@@ -177,6 +178,11 @@ class InferenceThread(threading.Thread):
         self._fau_intensity_buffer: List[Tuple[float, float]] = []  # (timestamp, value)
         self._audio_intensity_buffer: List[Tuple[float, float]] = []  # (timestamp, value)
 
+        # Rolling sequence buffer for temporal context (last SEQ_LEN frames)
+        self._seq_visual: deque = deque(maxlen=SEQ_LEN)
+        self._seq_audio: deque = deque(maxlen=SEQ_LEN)
+        self._seq_geometric: deque = deque(maxlen=SEQ_LEN)
+
         # Initialize neural fusion head (NuancedStateClassifier) on device.
         if torch.backends.mps.is_available():
             self.device = torch.device("mps")
@@ -185,9 +191,11 @@ class InferenceThread(threading.Thread):
         else:
             self.device = torch.device("cpu")
 
-        self.classifier = NuancedStateClassifier(input_dim=5, hidden_dim=64).to(
-            self.device
-        )
+        self.classifier = NuancedStateClassifier(
+            visual_dim=384,
+            audio_dim=768,
+            hidden_dim=256,
+        ).to(self.device)
         weights_path = "weights/fusion_v1.pth"
         try:
             state_dict = torch.load(weights_path, map_location=self.device)
@@ -238,6 +246,30 @@ class InferenceThread(threading.Thread):
         is_incongruent = delay > INCONGRUENT_DELAY_THRESHOLD_S
         return is_incongruent, delay
 
+    @staticmethod
+    def _detect_micro_expression(geometric_buffer: np.ndarray) -> bool:
+        """
+        Detect if a specific FAU (e.g. FAU4 brow lowerer) spiked and vanished
+        within the window. geometric_buffer: [T, 5] with cols [fau12, fau6, fau4, jitter, intensity].
+        """
+        if geometric_buffer is None or geometric_buffer.shape[0] < 3:
+            return False
+        FAU4_IDX = 2
+        SPIKE_THRESHOLD = 0.5
+        VANISH_THRESHOLD = 0.35
+        fau4 = np.asarray(geometric_buffer[:, FAU4_IDX], dtype=np.float32)
+        peak_val = float(np.max(fau4))
+        if peak_val < SPIKE_THRESHOLD:
+            return False
+        peak_idx = int(np.argmax(fau4))
+        # Must have "vanished" by the end: last value low, and peak was not at the very last step
+        last_val = float(fau4[-1])
+        if last_val > VANISH_THRESHOLD:
+            return False
+        if peak_idx >= fau4.size - 1:
+            return False
+        return True
+
     def run(self) -> None:
         print("[InferenceThread] Started AV feature + neural fusion loop.")
 
@@ -270,16 +302,39 @@ class InferenceThread(threading.Thread):
                         self._update_sync_buffers(fau_intensity, intensity)
                         synchrony_incongruent, sync_delay_sec = self.check_synchrony()
 
-                        feat_vec = torch.tensor(
+                        visual_latent = visual_summary.get("visual_latent")
+                        audio_latent = audio_features.get("audio_latent")
+                        if visual_latent is None:
+                            visual_latent = np.zeros(384, dtype=np.float32)
+                        if audio_latent is None:
+                            audio_latent = np.zeros(768, dtype=np.float32)
+                        geometric = np.array(
                             [fau12, fau6, fau4, jitter, intensity],
-                            dtype=torch.float32,
-                            device=self.device,
-                        )  # [5]
+                            dtype=np.float32,
+                        )
 
-                        # Neural prediction first
-                        pred = self.classifier.predict(feat_vec)
+                        # Append to sequence buffer (rolling last SEQ_LEN frames)
+                        self._seq_visual.append(visual_latent.copy())
+                        self._seq_audio.append(audio_latent.copy())
+                        self._seq_geometric.append(geometric.copy())
+
+                        # Build [1, seq_len, dim] tensors; pad with zeros if buffer not yet full
+                        n = len(self._seq_visual)
+                        seq_vis = np.zeros((SEQ_LEN, 384), dtype=np.float32)
+                        seq_aud = np.zeros((SEQ_LEN, 768), dtype=np.float32)
+                        seq_geo = np.zeros((SEQ_LEN, 5), dtype=np.float32)
+                        seq_vis[SEQ_LEN - n:] = np.stack(self._seq_visual)
+                        seq_aud[SEQ_LEN - n:] = np.stack(self._seq_audio)
+                        seq_geo[SEQ_LEN - n:] = np.stack(self._seq_geometric)
+
+                        # Neural prediction (GMF + LSTM + conflict attention) on sequence
+                        pred = self.classifier.predict(seq_vis, seq_aud, seq_geo)
+
+                        # Micro-expression: FAU spike-and-vanish in the geometric buffer
+                        micro_expression = self._detect_micro_expression(seq_geo)
                         neural_state = pred.label
                         neural_confidence = pred.confidence
+                        conflict_score = pred.conflict_score
 
                         # Hybrid Gate (utils.fusion): physical overrides
                         body_data = {
@@ -297,8 +352,6 @@ class InferenceThread(threading.Thread):
                             audio_data,
                             synchrony_incongruent=synchrony_incongruent,
                         )
-
-                        conflict_score = float((1.0 - confidence) * 2.0)
 
                         with self.state_lock:
                             self.state_container["state"] = state
@@ -318,6 +371,7 @@ class InferenceThread(threading.Thread):
                                 "intensity": intensity,
                             }
                             self.state_container["sync_delay"] = sync_delay_sec
+                            self.state_container["micro_expression"] = micro_expression
                     except Exception as e:
                         print(f"[InferenceThread] ERROR during neural inference: {e}")
 
@@ -336,6 +390,7 @@ def draw_hud(
     show_analyzing: bool,
     show_masking: bool,
     show_bored: bool,
+    show_micro_expression: bool,
     conflict_score: Optional[float],
     fau: Optional[Dict[str, float]],
     audio_summary: Optional[Dict[str, float]],
@@ -347,8 +402,8 @@ def draw_hud(
 ) -> np.ndarray:
     """
     Draws the HUD: state (Override = Cyan, Neural = Green), physical labels
-    (TAPPING, HAND-TO-FACE), gesture labels (ANALYZING, MASKING, BORED when
-    persisted >10 frames), Synchrony Visualizer, Logic Conflict thick box, and Logic Source.
+    (TAPPING, HAND-TO-FACE), gesture labels (ANALYZING, MASKING, BORED, Micro-Expression),
+    Synchrony Visualizer, Logic Conflict thick box, and Logic Source.
     """
     hud_frame = frame.copy()
 
@@ -462,6 +517,18 @@ def draw_hud(
                     1,
                     cv2.LINE_AA,
                 )
+                label_y -= 16
+            if show_micro_expression:
+                cv2.putText(
+                    hud_frame,
+                    "Micro-Expression",
+                    (x_min, label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 128, 255),  # Magenta BGR
+                    1,
+                    cv2.LINE_AA,
+                )
             if logic_conflict:
                 cv2.putText(
                     hud_frame,
@@ -525,7 +592,7 @@ def draw_hud(
         (10, 120),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
-        (200, 200, 200),
+        (255, 255, 255),
         2,
         cv2.LINE_AA,
     )
@@ -643,6 +710,7 @@ def main() -> None:
         "audio_summary": None,
         "confidence": None,
         "sync_delay": 0.0,
+        "micro_expression": False,
     }
 
     visual_expert = VisualExpert()
@@ -685,6 +753,9 @@ def main() -> None:
     masking_count = 0
     bored_count = 0
 
+    # SMA for sync_delay (window=5) to smooth the visual marker
+    sync_delay_sma_buffer: deque = deque(maxlen=5)
+
     with mp_face_detection.FaceDetection(
         model_selection=0, min_detection_confidence=0.5
     ) as face_detection:
@@ -726,6 +797,13 @@ def main() -> None:
                     audio_summary = state_container.get("audio_summary", None)
                     confidence = state_container.get("confidence", None)
                     sync_delay_sec = state_container.get("sync_delay", 0.0)
+                    micro_expression = bool(state_container.get("micro_expression", False))
+
+                # Apply SMA to sync_delay for smooth visual marker (window=5 frames)
+                sync_delay_sma_buffer.append(
+                    float(sync_delay_sec) if sync_delay_sec is not None else 0.0
+                )
+                sync_delay_smoothed = sum(sync_delay_sma_buffer) / len(sync_delay_sma_buffer)
 
                 # Update persistence: show label only if condition held > GESTURE_PERSIST_FRAMES
                 if hand_on_temple:
@@ -754,11 +832,12 @@ def main() -> None:
                     show_analyzing,
                     show_masking,
                     show_bored,
+                    micro_expression,
                     conflict_score,
                     fau,
                     audio_summary,
                     confidence,
-                    sync_delay_sec,
+                    sync_delay_smoothed,
                     detections,
                     width,
                     height,

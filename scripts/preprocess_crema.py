@@ -4,7 +4,7 @@ import os
 import pickle
 import subprocess
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import cv2
 import librosa
@@ -81,19 +81,35 @@ def aggregate_fau_features(
     return agg
 
 
+def aggregate_latent_features(latents_list: List[np.ndarray]) -> np.ndarray:
+    """
+    Return the mean embedding across frames (e.g. DINOv2 384-D).
+    Returns zeros if the list is empty.
+    """
+    if not latents_list:
+        return np.zeros(384, dtype=np.float32)
+    return np.mean(latents_list, axis=0).astype(np.float32)
+
+
 def extract_visual_features(
     video_path: Path, visual_expert: VisualExpert, frame_stride: int = 5
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], np.ndarray]:
     """
-    Run VisualExpert over a subset of frames and aggregate FAU intensities.
+    Run VisualExpert over a subset of frames: aggregate FAU intensities and
+    mean-pool DINOv2 latent embeddings.
+    Returns (visual_fau_dict, visual_latent_384).
     """
+    empty_fau = {"FAU12": 0.0, "FAU6": 0.0, "FAU4": 0.0}
+    empty_latent = np.zeros(384, dtype=np.float32)
+
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         print(f"[WARN] Unable to open video: {video_path}")
-        return {"FAU12": 0.0, "FAU6": 0.0, "FAU4": 0.0}
+        return empty_fau, empty_latent
 
     frame_idx = 0
     fau_frames: List[Dict[str, float]] = []
+    latent_frames: List[np.ndarray] = []
 
     while True:
         ret, frame = cap.read()
@@ -103,12 +119,16 @@ def extract_visual_features(
         if frame_idx % frame_stride == 0:
             fau = visual_expert.get_fau_intensities(frame)
             fau_frames.append(fau)
+            latent = visual_expert.get_latent_embeddings(frame)
+            latent_frames.append(latent)
 
         frame_idx += 1
 
     cap.release()
 
-    return aggregate_fau_features(fau_frames)
+    visual_fau = aggregate_fau_features(fau_frames)
+    visual_latent = aggregate_latent_features(latent_frames)
+    return visual_fau, visual_latent
 
 
 def extract_audio_features(
@@ -129,7 +149,7 @@ def extract_audio_features(
     return audio_expert.extract_features(audio_np)
 
 
-def process_pairs() -> None:
+def process_pairs(limit: int | None = None) -> None:
     """
     For each synchronized ID (e.g., 1001_DFA_ANG_XX), run VisualExpert and AudioExpert
     and save features as a .pkl file in Data/features/ with the ID as the filename.
@@ -141,6 +161,10 @@ def process_pairs() -> None:
     if not mp4_files:
         print(f"[INFO] No .mp4 files found in {PROC_VIDEO_DIR}")
         return
+
+    if limit is not None:
+        print(f"[INFO] Testing mode enabled: Processing only first {limit} files.")
+        mp4_files = mp4_files[:limit]
 
     print(f"[INFO] Extracting features for {len(mp4_files)} video/audio pairs ...")
 
@@ -155,13 +179,14 @@ def process_pairs() -> None:
 
         print(f"[FEAT] Processing ID: {stem}")
 
-        visual_feats = extract_visual_features(video_path, visual_expert)
+        visual_feats, visual_latent = extract_visual_features(video_path, visual_expert)
         audio_feats = extract_audio_features(audio_path, audio_expert)
 
         features = {
             "id": stem,
-            "visual_fau": visual_feats,
-            "audio": audio_feats,
+            "visual_fau": visual_feats,       # Geometric
+            "visual_latent": visual_latent,   # Deep DINOv2 (384-D)
+            "audio": audio_feats,             # Includes jitter, intensity, and audio_latent (768-D)
         }
 
         with open(out_path, "wb") as f:
@@ -171,7 +196,7 @@ def process_pairs() -> None:
 def main() -> None:
     ensure_dirs()
     convert_flv_to_mp4()
-    process_pairs()
+    process_pairs(limit=100)
 
 
 if __name__ == "__main__":

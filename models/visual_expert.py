@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import mediapipe as mp
 import numpy as np
+import torch
 
 # Pose landmark indices (MediaPipe Pose)
 _POSE_NOSE = 0
@@ -85,6 +86,23 @@ class VisualExpert:
             min_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
+
+        # Device: prefer MPS, then CUDA, then CPU
+        self.device = torch.device(
+            "mps"
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+            else "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+        self._dinov2 = torch.hub.load(
+            "facebookresearch/dinov2", "dinov2_vits14", pretrained=True, trust_repo=True
+        )
+        self._dinov2.to(self.device)
+        self._dinov2.eval()
+        # ImageNet normalization for DINOv2
+        self._imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+        self._imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
 
         # Temporal buffers for stability / movement (frame-level)
         # Shoulder rigidity: variance of Y-distance between pose landmarks 11 and 12
@@ -228,6 +246,66 @@ class VisualExpert:
             fau4_brow_lowerer=fau4,
         )
         return intensities.to_dict()
+
+    def get_latent_embeddings(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """
+        Crop the face using Face Mesh landmarks and return a 384-dimensional
+        DINOv2 feature vector. Returns zeros if no face is detected.
+
+        Args:
+            frame_bgr: BGR image [H, W, 3].
+
+        Returns:
+            np.ndarray of shape (384,) dtype float32.
+        """
+        DINO_SIZE = 224
+        EMBED_DIM = 384
+
+        landmarks = self._extract_first_face_landmarks(frame_bgr)
+        if landmarks is None:
+            return np.zeros(EMBED_DIM, dtype=np.float32)
+
+        xy, _ = landmarks  # xy: [num_landmarks, 2] in pixel coords
+        h, w = frame_bgr.shape[:2]
+
+        x_min, y_min = float(xy[:, 0].min()), float(xy[:, 1].min())
+        x_max, y_max = float(xy[:, 0].max()), float(xy[:, 1].max())
+        margin = 0.2
+        w_box = x_max - x_min
+        h_box = y_max - y_min
+        x_min = max(0, x_min - margin * w_box)
+        y_min = max(0, y_min - margin * h_box)
+        x_max = min(w, x_max + margin * w_box)
+        y_max = min(h, y_max + margin * h_box)
+        if x_max <= x_min or y_max <= y_min:
+            return np.zeros(EMBED_DIM, dtype=np.float32)
+
+        x_min_i, y_min_i = int(round(x_min)), int(round(y_min))
+        x_max_i, y_max_i = int(round(x_max)), int(round(y_max))
+        face_crop = frame_bgr[y_min_i:y_max_i, x_min_i:x_max_i]
+        if face_crop.size == 0:
+            return np.zeros(EMBED_DIM, dtype=np.float32)
+
+        face_resized = cv2.resize(face_crop, (DINO_SIZE, DINO_SIZE), interpolation=cv2.INTER_LINEAR)
+        face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
+        # [H, W, C] -> [1, C, H, W], float32 [0, 1]
+        tensor = torch.from_numpy(face_rgb).permute(2, 0, 1).unsqueeze(0).float().div(255.0)
+        tensor = tensor.to(self.device)
+        tensor = (tensor - self._imagenet_mean) / self._imagenet_std
+
+        with torch.no_grad():
+            out = self._dinov2(tensor)
+        # out may be (B, 1+N, C) or dict; take CLS token
+        if isinstance(out, dict):
+            feat = out.get("x_norm_clstoken") or out.get("x") or next(iter(out.values()))
+        else:
+            feat = out
+        if feat.dim() == 3:
+            feat = feat[:, 0, :]
+        feat = feat.squeeze(0).cpu().numpy().astype(np.float32)
+        if feat.size != EMBED_DIM:
+            return np.zeros(EMBED_DIM, dtype=np.float32)
+        return feat
 
     def _compute_pose_features(self, frame_rgb: np.ndarray) -> Tuple[float, float]:
         """
@@ -438,6 +516,8 @@ class VisualExpert:
             hand_covering_mouth,
         ) = self._compute_hand_features(frame_rgb, face_xy_norm, zone_boxes)
 
+        visual_latent = self.get_latent_embeddings(frame_bgr)
+
         return {
             **fau,
             "Shoulder_Rigidity": shoulder_rigidity,
@@ -448,6 +528,7 @@ class VisualExpert:
             "hand_on_right_temple": hand_on_right_temple,
             "hand_covering_mouth": hand_covering_mouth,
             "Finger_Tapping": finger_tapping,
+            "visual_latent": visual_latent,
         }
 
 

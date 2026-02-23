@@ -141,13 +141,17 @@ def get_balanced_paths(features_dir: Path, n_per_class: int, seed: int) -> List[
     return balanced
 
 
+VISUAL_DIM = 384
+AUDIO_DIM = 768
+GEOMETRIC_DIM = 5
+
+
 class CremaDataset(Dataset):
     """
     Dataset for CREMA-D feature .pkl files produced by scripts/preprocess_crema.py.
 
-    Each item contains:
-        x: concatenated feature vector [FAU12, FAU6, FAU4, jitter, intensity]
-        y: class index in [0, 9]
+    Returns visual_latent [384], audio_latent [768], geometric [5], and class index.
+    Latents are zeros when not present in the pkl (e.g. from older preprocess runs).
     """
 
     def __init__(self, features_dir: Path) -> None:
@@ -167,7 +171,7 @@ class CremaDataset(Dataset):
     def __len__(self) -> int:
         return len(self.paths)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         path = self.paths[idx]
         stem = path.stem  # e.g., 1001_DFA_HAP_LO
 
@@ -177,20 +181,41 @@ class CremaDataset(Dataset):
         visual = feat.get("visual_fau", {})
         audio = feat.get("audio", {})
 
+        visual_latent = feat.get("visual_latent")
+        if visual_latent is None:
+            visual_latent = np.zeros(VISUAL_DIM, dtype=np.float32)
+        else:
+            visual_latent = np.asarray(visual_latent, dtype=np.float32)
+        if visual_latent.size != VISUAL_DIM:
+            visual_latent = np.zeros(VISUAL_DIM, dtype=np.float32)
+
+        audio_latent = audio.get("audio_latent")
+        if audio_latent is None:
+            audio_latent = np.zeros(AUDIO_DIM, dtype=np.float32)
+        else:
+            audio_latent = np.asarray(audio_latent, dtype=np.float32)
+        if audio_latent.size != AUDIO_DIM:
+            audio_latent = np.zeros(AUDIO_DIM, dtype=np.float32)
+
         fau12 = float(visual.get("FAU12", 0.0))
         fau6 = float(visual.get("FAU6", 0.0))
         fau4 = float(visual.get("FAU4", 0.0))
         jitter = float(audio.get("jitter", 0.0))
         intensity = float(audio.get("intensity", 0.0))
-
-        x_np = np.asarray([fau12, fau6, fau4, jitter, intensity], dtype=np.float32)  # [5]
-        x = torch.from_numpy(x_np)  # [5]
+        geometric = torch.from_numpy(
+            np.asarray([fau12, fau6, fau4, jitter, intensity], dtype=np.float32)
+        )
 
         label_str = map_filename_to_label(stem)
         y_idx = label_to_index(label_str)
         y = torch.tensor(y_idx, dtype=torch.long)
 
-        return x, y
+        return (
+            torch.from_numpy(visual_latent),
+            torch.from_numpy(audio_latent),
+            geometric,
+            y,
+        )
 
 
 def get_device() -> torch.device:
@@ -239,8 +264,11 @@ def train(
     device = get_device()
     print(f"[INFO] Using device: {device}")
 
-    input_dim = 5  # [FAU12, FAU6, FAU4, jitter, intensity]
-    model = NuancedStateClassifier(input_dim=input_dim, hidden_dim=64).to(device)
+    model = NuancedStateClassifier(
+        visual_dim=VISUAL_DIM,
+        audio_dim=AUDIO_DIM,
+        hidden_dim=256,
+    ).to(device)
 
     # Optional: Use class weights to handle imbalanced dataset
     # Compute inverse frequency weights
@@ -260,12 +288,14 @@ def train(
         correct = 0
         total = 0
 
-        for x, y in dataloader:
-            x = x.to(device)  # [batch, 5]
-            y = y.to(device)  # [batch]
+        for visual_latent, audio_latent, geometric, y in dataloader:
+            visual_latent = visual_latent.to(device)
+            audio_latent = audio_latent.to(device)
+            geometric = geometric.to(device)
+            y = y.to(device)
 
             optimizer.zero_grad()
-            logits = model(x)  # [batch, 10]
+            logits, _ = model(visual_latent, audio_latent, geometric)
             loss = criterion(logits, y)
             loss.backward()
             optimizer.step()

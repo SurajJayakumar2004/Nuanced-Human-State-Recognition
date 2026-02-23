@@ -1,0 +1,112 @@
+# RNHS v1.0: Real-time Nuanced Human State Recognition
+
+## 1. Project Objective (The "Why")
+The core goal is to move beyond basic emotion classification. RNHS v1.0 focuses on **Modality Conflict Detection**—identifying when a person's facial expression contradicts their vocal tone. 
+- **Target States:** Sarcasm, Social Masking (Fake Smile), Controlled Annoyance, Hiding Stress, and Deep Focus.
+- **Innovation:** Use cross-modal disagreement as a primary feature for classification.
+
+## 2. Technical Architecture (The "How")
+- **Mode:** Local Terminal Application (No Web GUI).
+- **Threading:** Mandatory Producer-Consumer pattern using `threading` or `multiprocessing`.
+    - **Thread A (Capture):** OpenCV for Video (640x480), PyAudio for Audio (16kHz).
+    - **Thread B (Inference):** Processes synchronized AV chunks every 200-500ms.
+    - **Thread C (UI):** Renders a live 30FPS "Heads-Up Display" (HUD) overlay.
+- **Dataset Focus:** CREMA-D (utilizing .mp4 and .wav).
+
+## 3. The Model "Brain"
+- **Visual Expert:** MediaPipe (Face Mesh/FAUs) + DINOv2 for latent embeddings.
+- **Audio Expert:** Wav2Vec 2.0 or HuBERT for prosody and vocal stress (Jitter/Shimmer).
+- **Fusion Layer:** A **Gated Fusion Architecture**. Use a "Conflict Gate" that calculates the distance between visual and audio vectors. 
+- **Decision Logic:** If (Visual_Sentiment != Audio_Sentiment), flag as a "Nuanced State."
+
+## 4. Live Display & HUD Requirements
+- **Overlay HUD:** Draw real-time labels on the `cv2.imshow` window:
+    - Current State: [Label]
+    - Congruence: [Match/Conflict %]
+    - Visual FAU Activity: (e.g., FAU 12 Active)
+- **Visual Feedback:** Use a bounding box that changes color based on conflict (Green = Sincere, Red = Masked/Incongruent).
+
+## 5. Coding Constraints & Performance
+- **Latency:** Must maintain <50ms processing time per inference chunk.
+- **Clean Exit:** Implement signal handling to release Camera/Mic resources on `Ctrl+C`.
+- **Hardware:** Optimize for local compute (MPS for Mac, CUDA for Windows/NVIDIA).
+
+## 6. Resource Management (Free Tier)
+- **Model Preference:** Use `cursor-small` or `gpt-4o-mini` for boilerplate, file creation, and simple logic to save Premium credits.
+- **Premium Usage:** Reserved Claude 3.7 / GPT-4o for:
+    - Designing the Gated Fusion math.
+    - Debugging complex multi-threading race conditions.
+    - Implementing the Wav2Vec 2.0 / DINOv2 feature extraction logic.
+- **Batching:** When using Chat or Composer, request multiple small related changes in one prompt (e.g., "Create the requirements.txt AND the basic folder structure") to count as only 1 request.
+
+# RHNS HYBRID LOGIC: MULTIMODAL OVERRIDES
+# These rules override Neural Model predictions if specific physical markers are detected.
+
+## 1. CONFLICT DETECTION (The "Mask" Rules)
+- FAKE_SMILE: If (FAU12 > 0.6) AND (FAU6 < 0.2) -> Override: "Fake / Polite Face"
+- HIDING_STRESS: If (Audio_Jitter > 0.7) AND (Face_Intensity < 0.3) AND (Shoulder_Rigidity == High) -> Override: "Hiding Stress"
+- SARCASM: If (Pitch_Variance < 0.2) AND (Sentiment_Positivity == High) -> Override: "Sarcasm"
+
+## 2. COGNITIVE & BODY STATES
+- DEEP_FOCUS: If (Blink_Rate < 5/min) AND (FAU4 > 0.4) AND (Body_Stillness == High) -> State: "Deep Focus"
+- BOREDOM: If (Head_in_Hand == True) OR (Gaze_Wandering == True) -> State: "Boredom"
+- CONFUSION: If (Head_Tilt > 15deg) AND (Asymmetric_Brows == True) -> State: "Confusion"
+
+## 3. PHYSICAL OVERRIDES
+- CONTROLLED_ANNOYANCE: If (Lip_Press == True) AND (Finger_Tapping == True) -> Override: "Controlled Annoyance"
+- RELIEF: If (Exhale_Detected == True) AND (Shoulder_Drop == True) -> State: "Relief"
+- AWKWARDNESS: If (Averted_Gaze == True) AND (Self_Touching_Hands == True) -> State: "Awkwardness"
+
+## 4. BASE EMOTIONS
+- HAPPY: FAU12 + FAU6 + Symmetric + Relaxed Pose.
+- SAD: Inner Brow Raise + Slumped Shoulders.
+- ANGER: Glare + Leaning Forward + Clenched Fists.
+
+Hand Placement,Physical Marker,Master Logic Override
+Palm Supporting Chin,Hand weight fully on chin/jaw + Head Tilt.,Boredom (Cognitive disengagement)
+Index Finger on Temple,Hand near eye/temple + Reduced Blink Rate.,Deep Focus (Evaluation/Analysis)
+Hand Covering Mouth,Fingers/Palm obscuring the mouth region.,Hiding Stress (Suppression of speech/emotion)
+Touching Ear/Neck,Hand near earlobe or side of neck.,Awkwardness (Self-soothing/Anxiety)
+Rubbing Eyes/Brow,Movement in the upper T-zone.,Mental Fatigue (Variant of Boredom)
+
+A. The "Thinking" vs "Boredom" Gate
+DEEP_FOCUS_OVERRIDE: * Condition: Index_Finger_At_Temple == True AND Gaze_Velocity < 0.2 (Steady Gaze).
+
+Neural Conflict: If Model says 'Neutral', Force 'Deep Focus'.
+
+BOREDOM_OVERRIDE: * Condition: Palm_Supporting_Chin == True AND Blink_Rate > Normal AND Head_Tilt > 15°.
+
+Neural Conflict: If Model says 'Neutral', Force 'Boredom'.
+
+B. The "Deception/Masking" Gate
+FAKE_SMILE_STRICT:
+
+Condition: FAU12 (Smile) > 0.5 AND FAU6 (Eye Squint) < 0.15 AND Duration > 3.0s.
+
+Note: Real smiles are usually shorter and include the eyes. A long, eye-less smile is almost always polite/fake.
+
+HIDING_STRESS_STRICT:
+
+Condition: Hand_Covers_Mouth == True AND Audio_Jitter > 0.6 AND Shoulder_Rigidity > 0.8.
+
+# HUMAN BEHAVIORAL LOGIC - MASTER OVERRIDES
+
+## 1. THE DECEPTION TRIGGER (Incongruence)
+- If Neural_Model == "Happy" BUT (Shoulder_Rigidity > 0.8 OR Audio_Jitter > 0.7):
+    - State = "Fake / Polite Face"
+    - Conflict_Score = 0.9 (Critical)
+
+## 2. THE COGNITIVE LOAD TRIGGER
+- If (Hand_On_Temple == True) AND (Head_Tilt < 5deg):
+    - Priority_State = "Deep Focus"
+- If (Hand_On_Chin == True) AND (Head_Tilt > 15deg):
+    - Priority_State = "Boredom"
+
+## 3. THE SUPPRESSION TRIGGER
+- If (Hand_Covers_Mouth == True) AND (Blink_Rate > 20/min):
+    - State = "Hiding Stress"
+    - Label = "MASKING DETECTED"
+
+## 4. DYNAMIC SCALING
+- All boolean flags (Tapping, Touching) must persist for 15 frames (0.5s) to be valid, 
+  matching the human 'Micro-expression' window.
