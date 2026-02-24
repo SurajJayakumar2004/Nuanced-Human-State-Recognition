@@ -15,6 +15,8 @@ from models.audio_expert import AudioExpert
 from models.fusion_head import NuancedStateClassifier, SEQ_LEN
 from utils.fusion import classify_nuanced_state
 
+import os
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 class CameraThread(threading.Thread):
     """
@@ -196,7 +198,7 @@ class InferenceThread(threading.Thread):
             audio_dim=768,
             hidden_dim=256,
         ).to(self.device)
-        weights_path = "weights/fusion_v1.pth"
+        weights_path = "weights/fusion_v2_best.pth"
         try:
             state_dict = torch.load(weights_path, map_location=self.device)
             self.classifier.load_state_dict(state_dict)
@@ -335,6 +337,7 @@ class InferenceThread(threading.Thread):
                         neural_state = pred.label
                         neural_confidence = pred.confidence
                         conflict_score = pred.conflict_score
+                        gate_weight = pred.gate_weight
 
                         # Hybrid Gate (utils.fusion): physical overrides
                         body_data = {
@@ -372,12 +375,36 @@ class InferenceThread(threading.Thread):
                             }
                             self.state_container["sync_delay"] = sync_delay_sec
                             self.state_container["micro_expression"] = micro_expression
+                            self.state_container["gate_weight"] = gate_weight
                     except Exception as e:
                         print(f"[InferenceThread] ERROR during neural inference: {e}")
 
             time.sleep(self.interval_s)
 
         print("[InferenceThread] Stopped.")
+
+
+# XAI Dashboard layout (1280x720 canvas, 640x480 frame centered)
+CANVAS_W, CANVAS_H = 1280, 720
+FRAME_W, FRAME_H = 640, 480
+FRAME_X = (CANVAS_W - FRAME_W) // 2
+FRAME_Y = (CANVAS_H - FRAME_H) // 2
+
+
+def _draw_progress_bar(
+    canvas: np.ndarray,
+    x: int, y: int, w: int, h: int,
+    value: float,
+    label: str,
+    color_fill: Tuple[int, int, int] = (0, 180, 0),
+) -> None:
+    """Draw a horizontal progress bar with label. value in [0, 1]."""
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), (60, 60, 60), -1)
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), (180, 180, 180), 1)
+    fill_w = max(0, min(w, int(w * max(0.0, min(1.0, value)))))
+    if fill_w > 0:
+        cv2.rectangle(canvas, (x, y), (x + fill_w, y + h), color_fill, -1)
+    cv2.putText(canvas, label, (x, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def draw_hud(
@@ -399,220 +426,134 @@ def draw_hud(
     detections,
     width: int,
     height: int,
+    gate_weight: float = 0.5,
 ) -> np.ndarray:
     """
-    Draws the HUD: state (Override = Cyan, Neural = Green), physical labels
-    (TAPPING, HAND-TO-FACE), gesture labels (ANALYZING, MASKING, BORED, Micro-Expression),
-    Synchrony Visualizer, Logic Conflict thick box, and Logic Source.
+    XAI Dashboard: 1280x720 canvas, camera frame centered. Left = Visual evidences,
+    Right = Audio evidences, Bottom = Fusion brain (gate, conflict, sync), Top = Verdict.
     """
-    hud_frame = frame.copy()
+    canvas = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
+    canvas[:] = (20, 20, 20)
 
+    # Place live frame in center
+    if (frame.shape[1], frame.shape[0]) != (FRAME_W, FRAME_H):
+        frame_small = cv2.resize(frame, (FRAME_W, FRAME_H))
+    else:
+        frame_small = frame
+    canvas[FRAME_Y : FRAME_Y + FRAME_H, FRAME_X : FRAME_X + FRAME_W] = frame_small
+
+    fau = fau or {}
+    audio_summary = audio_summary or {}
+    conflict_val = float(conflict_score) if conflict_score is not None else 0.0
+    conflict_val = max(0.0, min(1.0, conflict_val))
+
+    # --- Top center: Verdict (large) ---
     state_text = state or "State: --"
-    conflict_text = (
-        f"Conflict Score: {conflict_score:.2f}"
-        if conflict_score is not None
-        else "Conflict Score: --"
-    )
-
-    # State text color: Cyan = Override, Green = Neural
     if logic_source in ("Rule-Override", "Override"):
-        state_color = (255, 255, 0)  # Cyan (BGR)
+        state_color = (255, 255, 0)  # Cyan BGR
     else:
-        state_color = (0, 255, 0)  # Green (BGR)
+        state_color = (0, 255, 0)  # Green BGR
+    (tw, th), _ = cv2.getTextSize(state_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 2)
+    tx = (CANVAS_W - tw) // 2
+    ty = FRAME_Y - 20
+    cv2.putText(canvas, state_text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 1.2, state_color, 2, cv2.LINE_AA)
 
-    # Bounding box color by conflict
-    if conflict_score is None:
-        box_color = (0, 255, 255)  # Yellow for unknown
-    elif conflict_score < 0.3:
-        box_color = (0, 255, 0)  # Green: Low conflict
-    elif conflict_score < 0.6:
-        box_color = (0, 165, 255)  # Orange: Moderate conflict
+    # --- Center: Face bbox (frame coords + offset to canvas) + MICRO-EXPRESSION ---
+    if conflict_val < 0.3:
+        box_color = (0, 255, 0)
+    elif conflict_val < 0.6:
+        box_color = (0, 165, 255)
     else:
-        box_color = (0, 0, 255)  # Red: High conflict
-
-    # Logic conflict: Neural said something "positive" but Rule says Fake -> thicker box
-    logic_conflict = (
-        state == "Fake / Polite Face"
-        and neural_state is not None
-        and neural_state != "Fake / Polite Face"
-    )
-    box_thickness = 4 if logic_conflict else 2
-
-    # Face bounding box and physical labels next to it
+        box_color = (0, 0, 255)
     if detections:
         for detection in detections:
             bbox = detection.location_data.relative_bounding_box
-            x_min = int(bbox.xmin * width)
-            y_min = int(bbox.ymin * height)
+            x_min = FRAME_X + int(bbox.xmin * width)
+            y_min = FRAME_Y + int(bbox.ymin * height)
             w = int(bbox.width * width)
             h = int(bbox.height * height)
-
-            x_min = max(0, x_min)
-            y_min = max(0, y_min)
-            x_max = min(width - 1, x_min + w)
-            y_max = min(height - 1, y_min + h)
-
-            cv2.rectangle(
-                hud_frame, (x_min, y_min), (x_max, y_max), box_color, box_thickness
-            )
-
-            # Physical iconography: labels above/near the face box
-            label_y = max(20, y_min - 8)
-            if finger_tapping:
-                cv2.putText(
-                    hud_frame,
-                    "TAPPING",
-                    (x_min, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (255, 200, 0),  # BGR
-                    1,
-                    cv2.LINE_AA,
-                )
-                label_y -= 16
-            if self_touching_hands:
-                cv2.putText(
-                    hud_frame,
-                    "HAND-TO-FACE",
-                    (x_min, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (255, 200, 0),
-                    1,
-                    cv2.LINE_AA,
-                )
-                label_y -= 16
-            if show_analyzing:
-                cv2.putText(
-                    hud_frame,
-                    "ANALYZING",
-                    (x_min, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (255, 255, 0),  # Cyan BGR
-                    1,
-                    cv2.LINE_AA,
-                )
-                label_y -= 16
-            if show_masking:
-                cv2.putText(
-                    hud_frame,
-                    "MASKING",
-                    (x_min, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (0, 0, 255),  # Red BGR
-                    1,
-                    cv2.LINE_AA,
-                )
-                label_y -= 16
-            if show_bored:
-                cv2.putText(
-                    hud_frame,
-                    "BORED",
-                    (x_min, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (0, 255, 255),  # Yellow BGR
-                    1,
-                    cv2.LINE_AA,
-                )
-                label_y -= 16
+            x_min = max(FRAME_X, x_min)
+            y_min = max(FRAME_Y, y_min)
+            x_max = min(FRAME_X + FRAME_W - 1, x_min + w)
+            y_max = min(FRAME_Y + FRAME_H - 1, y_min + h)
+            cv2.rectangle(canvas, (x_min, y_min), (x_max, y_max), box_color, 2)
             if show_micro_expression:
                 cv2.putText(
-                    hud_frame,
-                    "Micro-Expression",
-                    (x_min, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (255, 128, 255),  # Magenta BGR
-                    1,
-                    cv2.LINE_AA,
-                )
-            if logic_conflict:
-                cv2.putText(
-                    hud_frame,
-                    "Logic Conflict",
-                    (x_min, y_max + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 255),
-                    1,
-                    cv2.LINE_AA,
+                    canvas, "MICRO-EXPRESSION",
+                    (x_min, max(FRAME_Y + 10, y_min - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1, cv2.LINE_AA,
                 )
 
-    if fau is None:
-        fau = {}
-    if audio_summary is None:
-        audio_summary = {}
+    # --- Left panel: Visual Evidences ---
+    left_x = 24
+    bar_w, bar_h = 220, 14
+    y_pos = 80
+    cv2.putText(canvas, "Visual Evidences", (left_x, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
+    _draw_progress_bar(canvas, left_x, y_pos, bar_w, bar_h, float(fau.get("FAU12", 0.0)), "FAU12 (Lip)", (0, 200, 0))
+    y_pos += 28
+    _draw_progress_bar(canvas, left_x, y_pos, bar_w, bar_h, float(fau.get("FAU6", 0.0)), "FAU6 (Cheek)", (0, 200, 0))
+    y_pos += 28
+    _draw_progress_bar(canvas, left_x, y_pos, bar_w, bar_h, float(fau.get("FAU4", 0.0)), "FAU4 (Brow)", (0, 200, 0))
+    y_pos += 36
+    cv2.putText(canvas, "Body language:", (left_x, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+    y_pos += 22
+    if self_touching_hands:
+        cv2.putText(canvas, "Hand to face", (left_x, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1, cv2.LINE_AA)
+        y_pos += 20
+    if finger_tapping:
+        cv2.putText(canvas, "Tapping", (left_x, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1, cv2.LINE_AA)
 
-    jitter = float(audio_summary.get("jitter", 0.0))
-    intensity = float(audio_summary.get("intensity", 0.0))
-    conf_val = confidence if confidence is not None else 0.0
-    source_text = "Rule-Override" if logic_source in ("Rule-Override", "Override") else (logic_source or "Neural")
+    # --- Right panel: Audio Evidences ---
+    right_x = CANVAS_W - 24 - 220
+    y_pos = 80
+    cv2.putText(canvas, "Audio Evidences", (right_x, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
+    _draw_progress_bar(canvas, right_x, y_pos, bar_w, bar_h, float(audio_summary.get("intensity", 0.0)), "Voice Intensity", (200, 100, 0))
+    y_pos += 28
+    _draw_progress_bar(canvas, right_x, y_pos, bar_w, bar_h, float(audio_summary.get("jitter", 0.0)), "Vocal Jitter", (200, 100, 0))
 
-    # State label (Cyan = Override, Green = Neural)
-    cv2.putText(
-        hud_frame,
-        state_text,
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        state_color,
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        hud_frame,
-        conflict_text,
-        (10, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
+    # --- Bottom panel: Fusion Brain (gate, conflict, sync) ---
+    bottom_y = CANVAS_H - 95
+    cv2.putText(canvas, "Fusion Brain", (CANVAS_W // 2 - 60, bottom_y - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+    # Gate weight: horizontal gauge (0 = Voice, 1 = Face)
+    gw_x, gw_y = 24, bottom_y
+    gw_w = 400
+    cv2.putText(canvas, "Gate (Face vs Voice)", (gw_x, gw_y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    gw_y += 18
+    cv2.rectangle(canvas, (gw_x, gw_y), (gw_x + gw_w, gw_y + 16), (50, 50, 50), -1)
+    cv2.rectangle(canvas, (gw_x, gw_y), (gw_x + gw_w, gw_y + 16), (150, 150, 150), 1)
+    g = max(0.0, min(1.0, gate_weight))
+    cx = gw_x + int(gw_w * g)
+    cv2.line(canvas, (cx, gw_y), (cx, gw_y + 16), (0, 255, 255), 2)
+    cv2.putText(canvas, "Voice", (gw_x, gw_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "Face", (gw_x + gw_w - 32, gw_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+    # Conflict score bar
+    cx_x, cx_y = gw_x + gw_w + 40, bottom_y + 18
+    cx_w = 180
+    cv2.putText(canvas, "Conflict Score", (cx_x, cx_y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.rectangle(canvas, (cx_x, cx_y), (cx_x + cx_w, cx_y + 16), (50, 50, 50), -1)
+    cv2.rectangle(canvas, (cx_x, cx_y), (cx_x + cx_w, cx_y + 16), (150, 150, 150), 1)
+    fill = int(cx_w * conflict_val)
+    if fill > 0:
+        ccolor = (0, 0, 255) if conflict_val > 0.6 else (0, 165, 255) if conflict_val > 0.3 else (0, 255, 0)
+        cv2.rectangle(canvas, (cx_x, cx_y), (cx_x + fill, cx_y + 16), ccolor, -1)
+    # Sync delay (slider in bottom panel)
+    sync_x, sync_y = cx_x + cx_w + 40, bottom_y
+    sync_w, sync_h = 200, 36
+    delay = float(sync_delay_sec) if sync_delay_sec is not None else 0.0
+    delay = max(-0.5, min(0.5, delay))
+    center_sync = sync_x + sync_w // 2
+    cv2.rectangle(canvas, (sync_x, sync_y), (sync_x + sync_w, sync_y + sync_h), (40, 40, 40), -1)
+    cv2.rectangle(canvas, (sync_x, sync_y), (sync_x + sync_w, sync_y + sync_h), (180, 180, 180), 1)
+    cv2.line(canvas, (center_sync, sync_y), (center_sync, sync_y + sync_h), (200, 200, 200), 1)
+    marker_x = int(center_sync + delay * (sync_w * 0.9))
+    marker_x = max(sync_x + 2, min(sync_x + sync_w - 2, marker_x))
+    mcolor = (0, 255, 0) if abs(delay) <= 0.2 else (0, 0, 255) if abs(delay) > 0.3 else (0, 165, 255)
+    cv2.line(canvas, (marker_x, sync_y), (marker_x, sync_y + sync_h), mcolor, 2)
+    ms = int(round(delay * 1000))
+    delay_str = f"+{ms}ms" if ms >= 0 else f"{ms}ms"
+    cv2.putText(canvas, f"Sync {delay_str}", (sync_x, sync_y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
-    cv2.putText(
-        hud_frame,
-        f"FAU12: {float(fau.get('FAU12', 0.0)):.2f}  "
-        f"FAU6: {float(fau.get('FAU6', 0.0)):.2f}  "
-        f"FAU4: {float(fau.get('FAU4', 0.0)):.2f}",
-        (10, 90),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-
-    cv2.putText(
-        hud_frame,
-        f"Jitter: {jitter:.2f}  Intensity: {intensity:.2f}  Conf: {conf_val:.2f}",
-        (10, 120),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-
-    # Synchrony Visualizer: 200x50 box at bottom left; zero line center; marker by delay
-    _draw_sync_visualizer(hud_frame, sync_delay_sec, width, height)
-
-    # Logic Source at bottom of HUD
-    cv2.putText(
-        hud_frame,
-        f"Logic Source: {source_text}",
-        (10, height - 12),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (180, 180, 180),
-        1,
-        cv2.LINE_AA,
-    )
-
-    return hud_frame
+    return canvas
 
 
 def _draw_sync_visualizer(
@@ -711,6 +652,7 @@ def main() -> None:
         "confidence": None,
         "sync_delay": 0.0,
         "micro_expression": False,
+        "gate_weight": 0.5,
     }
 
     visual_expert = VisualExpert()
@@ -822,6 +764,7 @@ def main() -> None:
                 show_masking = masking_count > GESTURE_PERSIST_FRAMES
                 show_bored = bored_count > GESTURE_PERSIST_FRAMES
 
+                gate_weight = state_container.get("gate_weight", 0.5)
                 hud_frame = draw_hud(
                     frame,
                     state,
@@ -841,6 +784,7 @@ def main() -> None:
                     detections,
                     width,
                     height,
+                    gate_weight=gate_weight,
                 )
 
                 cv2.imshow("RHNS v1.0 - Nuanced State HUD", hud_frame)

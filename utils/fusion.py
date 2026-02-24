@@ -17,12 +17,15 @@ def _get_scalar(features: Dict[str, Any], *keys: str, default: float = 0.0) -> f
     return float(default)
 
 
+# Valid 6-class CREMA-D emotions (must match NUANCED_STATE_LABELS in fusion_head)
+VALID_STATES = frozenset({"Angry", "Disgust", "Fear", "Happy", "Neutral", "Sad"})
+
+
 def _is_neutral(neural_prediction: str) -> bool:
-    """True if neural prediction is neutral / sincere."""
+    """True if neural prediction is Neutral."""
     if neural_prediction is None:
         return False
-    s = neural_prediction.strip().lower()
-    return "neutral" in s or "sincere" in s or s == "mixed feelings"
+    return neural_prediction.strip() == "Neutral"
 
 
 def classify_nuanced_state(
@@ -35,9 +38,10 @@ def classify_nuanced_state(
 ) -> Tuple[str, float, str]:
     """
     Hybrid Gate: applies physical overrides to neural prediction.
+    All overrides return one of the 6 base emotions: Angry, Disgust, Fear, Happy, Neutral, Sad.
 
     Args:
-        neural_prediction: State string from the neural classifier.
+        neural_prediction: State string from the neural classifier (6-class).
         neural_confidence: Confidence [0, 1] from the neural model.
         fau_data: FAU intensities, keys FAU12, FAU6, FAU4 (float [0, 1]).
         body_data: Rigidity, tilt, touching, tapping. Expected keys:
@@ -45,12 +49,12 @@ def classify_nuanced_state(
             - "Head_Tilt" (float [0, 1])
             - "Self_Touching_Hands" (bool)
             - "Finger_Tapping" (bool)
-        audio_data: At least "jitter" (float [0, 1]) for Hiding Stress rule.
+        audio_data: At least "jitter" (float [0, 1]) for stress rule.
         synchrony_incongruent: True when Visual_Peak follows Audio_Peak by >300ms;
-            biases result toward Sarcasm or Fake / Polite Face.
+            biases result toward Happy (sarcastic) or Neutral (fake smile).
 
     Returns:
-        final_state: str
+        final_state: str (one of 6 base emotions)
         confidence: float in [0, 1]
         logic_source: "Neural" or "Override"
     """
@@ -70,29 +74,34 @@ def classify_nuanced_state(
     audio_jitter = _get_scalar(audio_data, "jitter", "stress", "audio_stress", default=0.0)
     audio_jitter = float(np.clip(audio_jitter, 0.0, 1.0))
 
-    # Physical overrides (order matters: first match wins)
+    # Ensure neural prediction is valid; fallback to Neutral if unknown
+    if neural_prediction not in VALID_STATES:
+        neural_prediction = "Neutral"
 
-    # Temporal synchrony: Visual peak followed audio peak by >300ms → Incongruent; bias to Sarcasm or Fake Smile
+    # Physical overrides (order matters: first match wins)
+    # All overrides map to 6 base emotions.
+
+    # Temporal synchrony: Visual peak followed audio peak by >300ms → Incongruent
     if synchrony_incongruent:
         if fau_intensity > 0.35:
-            return "Sarcasm", 0.82, "Override"
-        return "Fake / Polite Face", 0.82, "Override"
+            return "Happy", 0.82, "Override"  # Sarcastic smile
+        return "Neutral", 0.82, "Override"  # Fake smile
 
-    # Boredom: Self_Touching_Hands AND low face intensity
+    # Boredom-like: Self_Touching_Hands AND low face intensity → Neutral
     if touching and fau_intensity < 0.3:
-        return "Boredom", 0.85, "Override"
+        return "Neutral", 0.85, "Override"
 
-    # Hiding Stress: Neural says neutral BUT rigid shoulders + high jitter
+    # Hiding Stress: Neural says Neutral BUT rigid shoulders + high jitter → Fear
     if _is_neutral(neural_prediction) and rigidity > 0.85 and audio_jitter > 0.6:
-        return "Hiding Stress", 0.88, "Override"
+        return "Fear", 0.88, "Override"
 
-    # Awkwardness: Self_Touching_Hands (e.g. hand-to-hand) AND fake smile
+    # Awkwardness-like: Self_Touching_Hands AND smile → Neutral (uncomfortable)
     if touching and fau12 > 0.4:
-        return "Awkwardness", 0.85, "Override"
+        return "Neutral", 0.85, "Override"
 
-    # Controlled Annoyance: Finger_Tapping AND neural says neutral
+    # Controlled Annoyance: Finger_Tapping AND neural says Neutral → Angry
     if tapping and _is_neutral(neural_prediction):
-        return "Controlled Annoyance", 0.85, "Override"
+        return "Angry", 0.85, "Override"
 
     return neural_prediction, neural_confidence, "Neural"
 

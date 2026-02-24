@@ -3,7 +3,7 @@
 RHNS v2.0 — Core training script for the GMF + Conflict Attention + LSTM model.
 
 1. Data: Load (15, 384) visual, (15, 768) audio, (15, 5) geometric sequences from .pkl.
-2. Weighted sampling: Class weights so Mixed Feelings (73.1%) and Sarcasm (1.2%) are seen
+2. Weighted sampling: Class weights so imbalanced 6-class CREMA-D emotions are seen
    equally by the model each epoch (WeightedRandomSampler).
 3. Architecture: NuancedStateClassifier; Xavier uniform init for all linear and LSTM layers.
 4. M1 (MPS): device='mps', AdamW + OneCycleLR, batch_size 64 or 128; float32 only (no autocast) for Metal stability.
@@ -30,6 +30,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
+from tqdm import tqdm
 
 from models.fusion_head import (
     NuancedStateClassifier,
@@ -45,6 +46,7 @@ PROGRESS_PLOT_PATH = REPORTS_DIR / "training_progress_v2.png"
 CONFUSION_MATRIX_PATH = REPORTS_DIR / "confusion_matrix_v2.png"
 RANDOM_SEED = 42
 DEFAULT_BATCH_SIZE = 64  # 64 or 128 for M1 Unified Memory
+MAX_SAMPLES_PER_CLASS = 90  # None = use all; 90 = limited balanced dataset
 SEQ_LEN = 15
 VISUAL_DIM = 384
 AUDIO_DIM = 768
@@ -52,51 +54,26 @@ GEOMETRIC_DIM = 5  # FAU12, FAU6, FAU4, jitter, intensity
 
 
 def map_filename_to_label(stem: str) -> str:
-    """CREMA-D stem -> nuanced state (same logic as train_model / audit)."""
-    parts = stem.split("_")
-    if len(parts) < 4:
-        return "Mixed Feelings"
-    _, _, emo, inten = parts[:4]
-    emo, inten = emo.upper(), inten.upper()
-    if emo == "HAP" and inten == "LO":
-        return "Fake / Polite Face"
-    if emo in {"SAD", "FEA"} and inten == "HI":
-        return "Hiding Stress"
-    if emo == "NEU" and inten == "XX":
-        h = hash(stem) % 3
-        if h == 0:
-            return "Deep Focus"
-        if h == 1:
-            return "Confusion"
-        return "Boredom"
-    if emo == "NEU" and inten == "MD":
-        return "Deep Focus"
-    if emo == "ANG" and inten == "MD":
-        return "Deep Focus"
-    if emo == "HAP" and inten == "HI":
-        return "Sarcasm"
-    if emo == "NEU" and inten == "HI":
-        return "Confusion"
-    if emo == "ANG" and inten == "HI":
-        return "Confusion"
-    if emo == "NEU" and inten == "LO":
-        return "Boredom"
-    if emo == "DIS" and inten == "LO":
-        return "Boredom"
-    if emo == "DIS" and inten == "MD":
-        return "Awkwardness"
-    if emo == "ANG" and inten == "LO":
-        return "Controlled Annoyance"
-    if emo == "SAD" and inten == "LO":
-        return "Relief"
-    return "Mixed Feelings"
+    parts = stem.split('_')
+    if len(parts) < 3:
+        return 'Neutral'
+    emo = parts[2].upper()
+    mapping = {
+        'ANG': 'Angry',
+        'DIS': 'Disgust',
+        'FEA': 'Fear',
+        'HAP': 'Happy',
+        'NEU': 'Neutral',
+        'SAD': 'Sad'
+    }
+    return mapping.get(emo, 'Neutral')
 
 
 def label_to_index(label: str) -> int:
     try:
         return NUANCED_STATE_LABELS.index(label)
     except ValueError:
-        return NUANCED_STATE_LABELS.index("Mixed Feelings")
+        return NUANCED_STATE_LABELS.index("Neutral")
 
 
 def get_device(force_mps: bool = True) -> torch.device:
@@ -185,7 +162,7 @@ def plot_confusion_matrix(
     with torch.no_grad():
         for v, a, g, y in val_loader:
             v, a, g = v.to(device), a.to(device), g.to(device)
-            logits, _ = model(v, a, g)
+            logits, _, _ = model(v, a, g)
             preds = logits.argmax(dim=-1).cpu().numpy()
             all_preds.extend(preds.tolist())
             all_labels.extend(y.cpu().numpy().tolist())
@@ -282,12 +259,13 @@ class CremaTemporalDataset(Dataset):
 
 
 def build_paths_and_weights(
-    features_dir: Path, seed: int
+    features_dir: Path,
+    seed: int,
+    max_per_class: int | None = MAX_SAMPLES_PER_CLASS,
 ) -> Tuple[List[Path], List[Path], torch.Tensor, List[float]]:
     """
-    Scan .pkl, compute 80/20 train/val split. Class weights and per-sample weights
-    (1 / class_count) so WeightedRandomSampler gives balanced exposure: e.g. Mixed
-    Feelings (73.1%) and Sarcasm (1.2%) are seen equally by the model each epoch.
+    Scan .pkl, optionally cap at max_per_class samples per class, then 80/20 train/val split.
+    Class weights and per-sample weights (1 / class_count) for WeightedRandomSampler.
     Returns (train_paths, val_paths, class_weights_tensor, sample_weights_for_sampler).
     """
     all_paths = sorted(features_dir.glob("*.pkl"))
@@ -295,6 +273,19 @@ def build_paths_and_weights(
         raise RuntimeError(f"No .pkl files in {features_dir}")
 
     rng = random.Random(seed)
+    if max_per_class is not None:
+        by_label: Dict[str, List[Path]] = defaultdict(list)
+        for p in all_paths:
+            by_label[map_filename_to_label(p.stem)].append(p)
+        pooled: List[Path] = []
+        for label in NUANCED_STATE_LABELS:
+            paths = by_label.get(label, [])
+            n_take = min(max_per_class, len(paths)) if paths else 0
+            if n_take > 0:
+                pooled.extend(rng.sample(paths, n_take))
+        rng.shuffle(pooled)
+        all_paths = pooled
+
     rng.shuffle(all_paths)
     n = len(all_paths)
     n_train = int(0.8 * n)
@@ -342,10 +333,13 @@ def train(
     print(f"[INFO] Device: {device} (MPS forced for M1)")
 
     train_paths, val_paths, class_weights, sample_weights = build_paths_and_weights(
-        FEATURES_DIR, RANDOM_SEED
+        FEATURES_DIR, RANDOM_SEED, max_per_class=MAX_SAMPLES_PER_CLASS
     )
     class_weights = class_weights.to(device)
-    print(f"[INFO] Train samples: {len(train_paths)}, Val samples: {len(val_paths)}")
+    if MAX_SAMPLES_PER_CLASS is not None:
+        print(f"[INFO] Train samples: {len(train_paths)}, Val samples: {len(val_paths)} (max {MAX_SAMPLES_PER_CLASS} per class)")
+    else:
+        print(f"[INFO] Train samples: {len(train_paths)}, Val samples: {len(val_paths)}")
 
     train_ds = CremaTemporalDataset(train_paths)
     val_ds = CremaTemporalDataset(val_paths)
@@ -359,14 +353,14 @@ def train(
         train_ds,
         batch_size=batch_size,
         sampler=sampler,
-        num_workers=0,
+        num_workers=0,  # 0 to prevent hanging on macOS
         pin_memory=(device.type == "cuda"),
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=0,  # 0 to prevent hanging on macOS
     )
 
     model = NuancedStateClassifier(
@@ -376,7 +370,7 @@ def train(
     ).to(device)
     _xavier_lstm_and_gated(model)
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     total_steps = len(train_loader) * epochs
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -399,6 +393,11 @@ def train(
         train_losses, val_losses, train_accs, val_accs, PROGRESS_PLOT_PATH
     )
 
+    # Early stopping
+    patience = 5
+    early_stop_counter = 0
+
+    print("[INFO] Data loaded. Starting training loop.")
     print("-" * 88)
     print(f"{'EPOCH':<10} {'Train Loss':<14} {'Train Acc':<12} {'Val Loss':<12} {'Val Acc':<10}")
     print("-" * 88)
@@ -409,11 +408,16 @@ def train(
         train_correct = 0
         train_total = 0
 
-        for v, a, g, y in train_loader:
+        train_pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch}/{epochs} [Train]",
+            leave=False,
+        )
+        for v, a, g, y in train_pbar:
             v, a, g, y = v.to(device), a.to(device), g.to(device), y.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            logits, _ = model(v, a, g)
+            logits, _, _ = model(v, a, g)
             loss = criterion(logits, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
@@ -424,20 +428,28 @@ def train(
             preds = logits.argmax(dim=-1)
             train_correct += (preds == y).sum().item()
             train_total += y.size(0)
+            train_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        train_pbar.close()
 
         model.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
+        val_pbar = tqdm(
+            val_loader,
+            desc=f"Epoch {epoch}/{epochs} [Val]",
+            leave=False,
+        )
         with torch.no_grad():
-            for v, a, g, y in val_loader:
+            for v, a, g, y in val_pbar:
                 v, a, g, y = v.to(device), a.to(device), g.to(device), y.to(device)
-                logits, _ = model(v, a, g)
+                logits, _, _ = model(v, a, g)
                 loss = criterion(logits, y)
                 val_loss += loss.item() * y.size(0)
                 preds = logits.argmax(dim=-1)
                 val_correct += (preds == y).sum().item()
                 val_total += y.size(0)
+        val_pbar.close()
 
         train_loss /= max(train_total, 1)
         train_acc = train_correct / max(train_total, 1)
@@ -454,9 +466,11 @@ def train(
             best_epoch_by_val_loss = epoch
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            early_stop_counter = 0
             torch.save(model.state_dict(), BEST_WEIGHTS_PATH)
             best_mark = " (best)"
         else:
+            early_stop_counter += 1
             best_mark = ""
 
         visualizer.plot(best_epoch=best_epoch_by_val_loss)
@@ -467,6 +481,10 @@ def train(
             f"{train_loss:<14.4f} {train_acc:<12.4f} "
             f"{val_loss:<12.4f} {val_acc:<10.4f}{best_mark}"
         )
+
+        if early_stop_counter >= patience:
+            print(f"[INFO] Early stopping triggered (no improvement for {patience} epochs).")
+            break
 
     print("-" * 88)
     print(f"[INFO] Best validation accuracy: {best_val_acc:.4f}")

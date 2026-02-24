@@ -37,82 +37,27 @@ RANDOM_SEED: int = 42
 
 
 def map_filename_to_label(stem: str) -> str:
-    """
-    Map CREMA-D style filename stem to a nuanced state label.
-
-    Example stem: 1001_DFA_HAP_LO
-    CREMA-D uses NEU+XX (not NEU+MD/LO/HI); we split NEU+XX across Deep Focus / Confusion / Boredom.
-    """
+    """Map CREMA-D stem to 6 base emotions. Mirrors train_temporal_model."""
     parts = stem.split("_")
-    if len(parts) < 4:
-        return "Mixed Feelings"
-
-    _, _, emo, inten = parts[:4]
-
-    emo = emo.upper()
-    inten = inten.upper()
-
-    # 1. Fake / Polite Face: Happy face but low voice energy (polite smile)
-    if emo == "HAP" and inten == "LO":
-        return "Fake / Polite Face"
-
-    # 2. Hiding Stress: Sad/fear face but high vocal stress (masking internal pressure)
-    if emo in {"SAD", "FEA"} and inten == "HI":
-        return "Hiding Stress"
-
-    # 3–5. CREMA-D has NEU+XX (no MD/LO/HI). Split by hash so all three get examples.
-    if emo == "NEU" and inten == "XX":
-        h = hash(stem) % 3
-        if h == 0:
-            return "Deep Focus"
-        if h == 1:
-            return "Confusion"
-        return "Boredom"
-
-    # 3. Deep Focus (also from ANG+MD: controlled/focused)
-    if emo == "NEU" and inten == "MD":
-        return "Deep Focus"
-    if emo == "ANG" and inten == "MD":
-        return "Deep Focus"
-
-    # 4. Sarcasm: Happy face but high intensity voice (contradictory signal)
-    if emo == "HAP" and inten == "HI":
-        return "Sarcasm"
-
-    # 5. Confusion: Neutral face but high vocal stress
-    if emo == "NEU" and inten == "HI":
-        return "Confusion"
-    if emo == "ANG" and inten == "HI":
-        return "Confusion"
-
-    # 6. Boredom: Neutral face, low energy voice
-    if emo == "NEU" and inten == "LO":
-        return "Boredom"
-    if emo == "DIS" and inten == "LO":
-        return "Boredom"
-
-    # 7. Awkwardness: Disgust/unease face, medium voice (uncomfortable)
-    if emo == "DIS" and inten == "MD":
-        return "Awkwardness"
-
-    # 8. Controlled Annoyance: Angry face but low voice (suppressing irritation)
-    if emo == "ANG" and inten == "LO":
-        return "Controlled Annoyance"
-
-    # 9. Relief: Sad face but low voice (stress releasing)
-    if emo == "SAD" and inten == "LO":
-        return "Relief"
-
-    # 10. Mixed Feelings: HAP+MD, DIS+HI, FEA+LO, FEA+MD, SAD+MD, etc.
-    return "Mixed Feelings"
+    if len(parts) < 3:
+        return "Neutral"
+    emo = parts[2].upper()
+    mapping = {
+        "ANG": "Angry",
+        "DIS": "Disgust",
+        "FEA": "Fear",
+        "HAP": "Happy",
+        "NEU": "Neutral",
+        "SAD": "Sad",
+    }
+    return mapping.get(emo, "Neutral")
 
 
 def label_to_index(label: str) -> int:
     try:
         return NUANCED_STATE_LABELS.index(label)
     except ValueError:
-        # Unknown label -> map to Mixed Feelings
-        return NUANCED_STATE_LABELS.index("Mixed Feelings")
+        return NUANCED_STATE_LABELS.index("Neutral")
 
 
 def get_balanced_paths(features_dir: Path, n_per_class: int, seed: int) -> List[Path]:

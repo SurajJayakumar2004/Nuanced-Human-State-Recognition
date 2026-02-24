@@ -14,16 +14,12 @@ LSTM_HIDDEN_SIZE = 128
 LSTM_NUM_LAYERS = 1
 
 NUANCED_STATE_LABELS: List[str] = [
-    "Fake / Polite Face",
-    "Hiding Stress",
-    "Deep Focus",
-    "Sarcasm",
-    "Confusion",
-    "Boredom",
-    "Awkwardness",
-    "Controlled Annoyance",
-    "Relief",
-    "Mixed Feelings",
+    "Angry",
+    "Disgust",
+    "Fear",
+    "Happy",
+    "Neutral",
+    "Sad",
 ]
 
 
@@ -33,6 +29,7 @@ class NuancedStatePrediction:
     confidence: float
     probabilities: np.ndarray  # [10]
     conflict_score: float  # [0, 1], higher when visual and audio latents disagree
+    gate_weight: float = 0.5  # GMF gate: 1 = visual, 0 = audio
 
 
 class NuancedStateClassifier(nn.Module):
@@ -86,13 +83,14 @@ class NuancedStateClassifier(nn.Module):
         self,
         visual_latent: torch.Tensor,
         audio_latent: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Project both modalities, compute gate g, fused vector, and conflict score.
 
         Returns:
             h_fused: [batch, hidden_dim]
             conflict_score: [batch] in [0, 1], higher when modalities are far apart
+            g: [batch, 1] gate in [0, 1], 1 = visual, 0 = audio
         """
         h_visual = self.visual_proj(visual_latent)  # [B, hidden_dim]
         h_audio = self.audio_proj(audio_latent)     # [B, hidden_dim]
@@ -107,7 +105,7 @@ class NuancedStateClassifier(nn.Module):
         cos_sim = F.cosine_similarity(h_visual, h_audio, dim=1)  # [B]
         conflict_score = (1.0 - cos_sim).clamp(0.0, 1.0)  # [B]
 
-        return h_fused, conflict_score
+        return h_fused, conflict_score, g
 
     def forward(
         self,
@@ -124,6 +122,7 @@ class NuancedStateClassifier(nn.Module):
         Returns:
             logits: [batch, 10]
             conflict_score: [batch]
+            last_gate: [batch, 1] GMF gate at last timestep (1 = visual, 0 = audio)
         """
         # Support both sequence (3D) and single-step (2D) input
         if visual_latent.dim() == 2:
@@ -135,9 +134,11 @@ class NuancedStateClassifier(nn.Module):
         # Flatten batch and time for per-step fusion
         v_flat = visual_latent.reshape(B * T, -1)
         a_flat = audio_latent.reshape(B * T, -1)
-        h_fused_flat, conflict_flat = self._fuse_and_conflict(v_flat, a_flat)
+        h_fused_flat, conflict_flat, g_flat = self._fuse_and_conflict(v_flat, a_flat)
         h_fused = h_fused_flat.reshape(B, T, self.hidden_dim)   # [B, T, 256]
         conflict_score = conflict_flat.reshape(B, T)             # [B, T]
+        g = g_flat.reshape(B, T, 1)                              # [B, T, 1]
+        last_gate = g[:, -1, :]                                   # [B, 1], gate at last timestep
 
         # LSTM over time; use last timestep's output
         lstm_out, _ = self.lstm(h_fused)   # [B, T, lstm_hidden_size]
@@ -149,7 +150,7 @@ class NuancedStateClassifier(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         logits = self.out(x)
-        return logits, last_conflict
+        return logits, last_conflict, last_gate
 
     @torch.no_grad()
     def predict(
@@ -194,11 +195,12 @@ class NuancedStateClassifier(nn.Module):
         elif geometric_features.ndim == 2:
             geometric_features = geometric_features.unsqueeze(0)
 
-        logits, conflict_scores = self.forward(
+        logits, conflict_scores, last_gate = self.forward(
             visual_latent, audio_latent, geometric_features
         )
         probs = F.softmax(logits, dim=-1)[0]
         conflict_score = float(conflict_scores[0].item())
+        gate_scalar = last_gate.mean().item()
 
         conf, idx = torch.max(probs, dim=-1)
         label = NUANCED_STATE_LABELS[int(idx.item())]
@@ -208,6 +210,7 @@ class NuancedStateClassifier(nn.Module):
             confidence=float(conf.item()),
             probabilities=probs.cpu().numpy(),
             conflict_score=conflict_score,
+            gate_weight=gate_scalar,
         )
 
 

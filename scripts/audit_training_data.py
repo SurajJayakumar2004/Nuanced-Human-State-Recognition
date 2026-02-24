@@ -20,64 +20,32 @@ from typing import Any, Dict, List, Tuple
 # Project root on path (for consistency; we duplicate mapping to avoid loading torch)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Same labels as fusion_head / train_model (no torch import)
+# Same labels as fusion_head / train_temporal_model (no torch import)
 NUANCED_STATE_LABELS = [
-    "Fake / Polite Face",
-    "Hiding Stress",
-    "Deep Focus",
-    "Sarcasm",
-    "Confusion",
-    "Boredom",
-    "Awkwardness",
-    "Controlled Annoyance",
-    "Relief",
-    "Mixed Feelings",
+    "Angry",
+    "Disgust",
+    "Fear",
+    "Happy",
+    "Neutral",
+    "Sad",
 ]
 
 
 def map_filename_to_label(stem: str) -> str:
-    """
-    Map CREMA-D style filename stem to a nuanced state label.
-    Mirrors scripts/train_model.py map_filename_to_label().
-    """
+    """Map CREMA-D stem to 6 base emotions. Mirrors train_temporal_model."""
     parts = stem.split("_")
-    if len(parts) < 4:
-        return "Mixed Feelings"
-    _, _, emo, inten = parts[:4]
-    emo = emo.upper()
-    inten = inten.upper()
-    if emo == "HAP" and inten == "LO":
-        return "Fake / Polite Face"
-    if emo in {"SAD", "FEA"} and inten == "HI":
-        return "Hiding Stress"
-    if emo == "NEU" and inten == "XX":
-        h = hash(stem) % 3
-        if h == 0:
-            return "Deep Focus"
-        if h == 1:
-            return "Confusion"
-        return "Boredom"
-    if emo == "NEU" and inten == "MD":
-        return "Deep Focus"
-    if emo == "ANG" and inten == "MD":
-        return "Deep Focus"
-    if emo == "HAP" and inten == "HI":
-        return "Sarcasm"
-    if emo == "NEU" and inten == "HI":
-        return "Confusion"
-    if emo == "ANG" and inten == "HI":
-        return "Confusion"
-    if emo == "NEU" and inten == "LO":
-        return "Boredom"
-    if emo == "DIS" and inten == "LO":
-        return "Boredom"
-    if emo == "DIS" and inten == "MD":
-        return "Awkwardness"
-    if emo == "ANG" and inten == "LO":
-        return "Controlled Annoyance"
-    if emo == "SAD" and inten == "LO":
-        return "Relief"
-    return "Mixed Feelings"
+    if len(parts) < 3:
+        return "Neutral"
+    emo = parts[2].upper()
+    mapping = {
+        "ANG": "Angry",
+        "DIS": "Disgust",
+        "FEA": "Fear",
+        "HAP": "Happy",
+        "NEU": "Neutral",
+        "SAD": "Sad",
+    }
+    return mapping.get(emo, "Neutral")
 
 
 FEATURES_DIR = Path("Data/features")
