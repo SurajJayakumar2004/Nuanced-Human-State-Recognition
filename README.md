@@ -1,4 +1,4 @@
-# RHNS v2.0: Real-Time Nuanced Human State Recognition
+# Real-Time Nuanced Human State Recognition
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-MPS_Optimized-EE4C2C)
