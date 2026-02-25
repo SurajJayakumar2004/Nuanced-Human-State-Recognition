@@ -46,7 +46,7 @@ PROGRESS_PLOT_PATH = REPORTS_DIR / "training_progress_v2.png"
 CONFUSION_MATRIX_PATH = REPORTS_DIR / "confusion_matrix_v2.png"
 RANDOM_SEED = 42
 DEFAULT_BATCH_SIZE = 64  # 64 or 128 for M1 Unified Memory
-MAX_SAMPLES_PER_CLASS = 90  # None = use all; 90 = limited balanced dataset
+MAX_SAMPLES_PER_CLASS = 500  # None = use all; 500 = limited balanced dataset
 SEQ_LEN = 15
 VISUAL_DIM = 384
 AUDIO_DIM = 768

@@ -38,25 +38,28 @@ def classify_nuanced_state(
 ) -> Tuple[str, float, str]:
     """
     Hybrid Gate: applies physical overrides to neural prediction.
-    All overrides return one of the 6 base emotions: Angry, Disgust, Fear, Happy, Neutral, Sad.
+    Base emotions from neural: Angry, Disgust, Fear, Happy, Neutral, Sad.
+    Rule overrides can refine to nuanced states: Frustration, Panic, Contempt.
 
     Args:
         neural_prediction: State string from the neural classifier (6-class).
         neural_confidence: Confidence [0, 1] from the neural model.
         fau_data: FAU intensities, keys FAU12, FAU6, FAU4 (float [0, 1]).
-        body_data: Rigidity, tilt, touching, tapping. Expected keys:
+        body_data: Rigidity, tilt, touching, tapping, posture. Expected keys:
             - "Shoulder_Rigidity" (float [0, 1])
-            - "Head_Tilt" (float [0, 1])
+            - "Head_Tilt" (float or degrees)
             - "Self_Touching_Hands" (bool)
             - "Finger_Tapping" (bool)
+            - "posture_asymmetry", "posture_slump"/"is_slumped", "shoulders_raised" (bool)
+            - "lean" (str: 'forward', 'back', 'neutral')
         audio_data: At least "jitter" (float [0, 1]) for stress rule.
         synchrony_incongruent: True when Visual_Peak follows Audio_Peak by >300ms;
             biases result toward Happy (sarcastic) or Neutral (fake smile).
 
     Returns:
-        final_state: str (one of 6 base emotions)
+        final_state: str (base emotion or nuanced: Frustration, Panic, Contempt)
         confidence: float in [0, 1]
-        logic_source: "Neural" or "Override"
+        logic_source: "Neural", "Override", "Rule-Override", or "Posture-Override"
     """
     fau12 = float(fau_data.get("FAU12", 0.0))
     fau6 = float(fau_data.get("FAU6", 0.0))
@@ -64,6 +67,13 @@ def classify_nuanced_state(
     fau_intensity = max(fau12, fau6, fau4)
 
     rigidity = _get_scalar(body_data, "Shoulder_Rigidity", "rigidity", default=0.0)
+    head_tilt = _get_scalar(body_data, "Head_Tilt", "head_tilt", default=0.0)
+    posture_asymmetry = body_data.get("posture_asymmetry", False)
+    is_slumped = body_data.get("is_slumped", body_data.get("posture_slump", False))
+    shoulders_raised = body_data.get("shoulders_raised", False)
+    lean = body_data.get("lean", "neutral")
+    if isinstance(lean, str):
+        lean = lean.strip().lower()
     touching = body_data.get("Self_Touching_Hands", False)
     if isinstance(touching, (int, float)):
         touching = bool(touching)
@@ -103,7 +113,32 @@ def classify_nuanced_state(
     if tapping and _is_neutral(neural_prediction):
         return "Angry", 0.85, "Override"
 
-    return neural_prediction, neural_confidence, "Neural"
+    # Contempt: Neutral/Happy + posture asymmetry or head tilt (Posture-Override)
+    if neural_prediction in ("Neutral", "Happy") and (
+        posture_asymmetry or head_tilt > 10
+    ):
+        return "Contempt", 0.85, "Posture-Override"
+
+    # Panic: Fear + shoulders raised + self-touching (Posture-Override)
+    if neural_prediction == "Fear" and shoulders_raised and touching:
+        return "Panic", 0.90, "Posture-Override"
+
+    # Frustration: Angry/Sad + lean forward + fidgeting (Posture-Override)
+    if neural_prediction in ("Angry", "Sad") and lean == "forward" and (
+        tapping or touching
+    ):
+        return "Frustration", 0.85, "Posture-Override"
+
+    # Confidence Boosters for base emotions (no state change)
+    final_confidence = neural_confidence
+    if neural_prediction == "Sad" and is_slumped:
+        final_confidence = 0.95
+    elif neural_prediction == "Angry" and lean == "forward":
+        final_confidence = 0.95
+    elif neural_prediction == "Disgust" and lean in ("back", "backward"):
+        final_confidence = 0.95
+
+    return neural_prediction, final_confidence, "Neural"
 
 
 __all__ = ["classify_nuanced_state"]

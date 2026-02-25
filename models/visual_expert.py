@@ -109,6 +109,8 @@ class VisualExpert:
         self._shoulder_y_distance_buffer: deque = deque(maxlen=15)
         self._fingertip_z_buffer: deque = deque(maxlen=10)
         self._head_tilt_buffer: deque = deque(maxlen=5)
+        # Nose-to-shoulder-midpoint distance for slump baseline
+        self._nose_shoulder_dist_buffer: deque = deque(maxlen=30)
 
     def _extract_first_face_landmarks(
         self, frame_bgr: np.ndarray
@@ -307,11 +309,18 @@ class VisualExpert:
             return np.zeros(EMBED_DIM, dtype=np.float32)
         return feat
 
-    def _compute_pose_features(self, frame_rgb: np.ndarray) -> Tuple[float, float]:
+    def _compute_pose_features(
+        self, frame_rgb: np.ndarray
+    ) -> Tuple[float, float, float, bool, bool, bool, str, Any]:
         """
-        Returns (shoulder_rigidity, head_tilt).
-        shoulder_rigidity: [0,1] from variance of Y-distance between POSE 11 and 12 (1 = very rigid).
-        head_tilt: [0,1] tilt magnitude (0 = upright, 1 = ~45+ deg).
+        Returns (shoulder_rigidity, head_tilt, head_tilt_deg, posture_asymmetry,
+                 posture_slump, shoulders_raised, lean, pose_landmarks).
+        shoulder_rigidity: [0,1] from variance of Y-distance between POSE 11 and 12.
+        head_tilt: [0,1] tilt magnitude.
+        posture_asymmetry: True if |y11 - y12| > 0.05.
+        posture_slump: True if nose-to-shoulder distance increases vs baseline.
+        shoulders_raised: True if shoulders unnaturally close to nose on Y-axis.
+        lean: 'forward' (z < -0.1), 'back' (z > 0.1), or 'neutral'.
         """
         h, w = frame_rgb.shape[:2]
         pose_out = self._pose.process(frame_rgb)
@@ -322,14 +331,54 @@ class VisualExpert:
                 rigidity = float(np.clip(1.0 - min(var * 50.0, 1.0), 0.0, 1.0))
             else:
                 rigidity = 0.0
-            return rigidity, 0.0
+            return rigidity, 0.0, 0.0, False, False, False, "neutral", None
 
         lm = pose_out.pose_landmarks.landmark
         # Y-distance between landmarks 11 (left shoulder) and 12 (right shoulder)
         y11 = lm[_POSE_LEFT_SHOULDER].y
         y12 = lm[_POSE_RIGHT_SHOULDER].y
+        z11 = lm[_POSE_LEFT_SHOULDER].z
+        z12 = lm[_POSE_RIGHT_SHOULDER].z
         y_distance = abs(y11 - y12)
         self._shoulder_y_distance_buffer.append(y_distance)
+
+        # Shoulder Asymmetry: |y11 - y12| > 0.05
+        posture_asymmetry = y_distance > 0.05
+
+        # Shoulder midpoint (normalized coords)
+        shoulder_mid_x = 0.5 * (lm[_POSE_LEFT_SHOULDER].x + lm[_POSE_RIGHT_SHOULDER].x)
+        shoulder_mid_y = 0.5 * (y11 + y12)
+        shoulder_mid_z = 0.5 * (z11 + z12)
+
+        # Nose (0)
+        nose_x = lm[_POSE_NOSE].x
+        nose_y = lm[_POSE_NOSE].y
+
+        # Nose-to-shoulder-midpoint distance (for slump)
+        nose_shoulder_dist = np.sqrt(
+            (nose_x - shoulder_mid_x) ** 2 + (nose_y - shoulder_mid_y) ** 2
+        )
+        self._nose_shoulder_dist_buffer.append(nose_shoulder_dist)
+
+        # Shoulder Slump: distance increases significantly vs baseline
+        posture_slump = False
+        if len(self._nose_shoulder_dist_buffer) >= 5:
+            baseline = float(np.mean(list(self._nose_shoulder_dist_buffer)[:-1]))
+            if baseline > 1e-6 and nose_shoulder_dist > baseline * 1.2:
+                posture_slump = True
+
+        # Shoulders Raised (Turtle): shoulders unnaturally close to nose on Y-axis
+        # Small vertical gap between nose and shoulders = hunched
+        y_gap = abs(nose_y - shoulder_mid_y)
+        shoulders_raised = y_gap < 0.12
+
+        # Lean (Z-axis): z < -0.1 forward, z > 0.1 back
+        if shoulder_mid_z < -0.1:
+            lean = "forward"
+        elif shoulder_mid_z > 0.1:
+            lean = "back"
+        else:
+            lean = "neutral"
 
         # Head tilt: angle of ear line vs horizontal (normalized coords)
         le_x, le_y = lm[_POSE_LEFT_EAR].x, lm[_POSE_LEFT_EAR].y
@@ -339,13 +388,23 @@ class VisualExpert:
         angle_rad = np.arctan2(abs(dy), max(abs(dx), 1e-6))
         angle_deg = np.degrees(angle_rad)
         head_tilt_scalar = float(np.clip(angle_deg / 45.0, 0.0, 1.0))
+        head_tilt_deg = float(angle_deg)
         self._head_tilt_buffer.append(head_tilt_scalar)
 
         # Shoulder rigidity = 1 - normalized variance of Y-distance (11 vs 12)
         vals = list(self._shoulder_y_distance_buffer)
         var = float(np.var(vals)) if len(vals) > 1 else 0.0
         rigidity = float(np.clip(1.0 - min(var * 50.0, 1.0), 0.0, 1.0))
-        return rigidity, head_tilt_scalar
+        return (
+            rigidity,
+            head_tilt_scalar,
+            head_tilt_deg,
+            posture_asymmetry,
+            posture_slump,
+            shoulders_raised,
+            lean,
+            pose_out.pose_landmarks,
+        )
 
     @staticmethod
     def _get_face_zone_boxes(
@@ -487,7 +546,9 @@ class VisualExpert:
                 Head_Tilt (float [0,1]),
                 Self_Touching_Hands (bool),
                 Finger_Tapping (bool),
-                hand_on_chin, hand_on_left_temple, hand_on_right_temple, hand_covering_mouth (bool).
+                hand_on_chin, hand_on_left_temple, hand_on_right_temple, hand_covering_mouth (bool),
+                posture_asymmetry, posture_slump, shoulders_raised (bool),
+                lean (str: 'forward', 'back', 'neutral').
         """
         h, w = frame_bgr.shape[:2]
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -501,7 +562,20 @@ class VisualExpert:
             xy, _ = landmarks
             face_xy_norm = np.column_stack([xy[:, 0] / w, xy[:, 1] / h])
 
-        shoulder_rigidity, head_tilt = self._compute_pose_features(frame_rgb)
+        (
+            shoulder_rigidity,
+            head_tilt,
+            head_tilt_deg,
+            posture_asymmetry,
+            posture_slump,
+            shoulders_raised,
+            lean,
+            pose_landmarks,
+        ) = self._compute_pose_features(frame_rgb)
+
+        # Face mesh results for landmark overlay
+        face_results = self._face_mesh.process(frame_rgb)
+        face_landmarks = face_results.multi_face_landmarks if face_results.multi_face_landmarks else None
         zone_boxes = (
             self._get_face_zone_boxes(face_xy_norm)
             if face_xy_norm is not None
@@ -522,6 +596,7 @@ class VisualExpert:
             **fau,
             "Shoulder_Rigidity": shoulder_rigidity,
             "Head_Tilt": head_tilt,
+            "Head_Tilt_deg": head_tilt_deg,
             "Self_Touching_Hands": self_touching,
             "hand_on_chin": hand_on_chin,
             "hand_on_left_temple": hand_on_left_temple,
@@ -529,6 +604,13 @@ class VisualExpert:
             "hand_covering_mouth": hand_covering_mouth,
             "Finger_Tapping": finger_tapping,
             "visual_latent": visual_latent,
+            # Body posture metrics
+            "posture_asymmetry": posture_asymmetry,
+            "posture_slump": posture_slump,
+            "shoulders_raised": shoulders_raised,
+            "lean": lean,
+            "face_landmarks": face_landmarks,
+            "pose_landmarks": pose_landmarks,
         }
 
 
