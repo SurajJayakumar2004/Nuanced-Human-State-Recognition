@@ -205,7 +205,7 @@ class InferenceThread(threading.Thread):
             audio_dim=768,
             hidden_dim=256,
         ).to(self.device)
-        weights_path = "weights/fusion_v2_best.pth"
+        weights_path = "weights/fusion_90samples_per_class.pth"
         try:
             state_dict = torch.load(weights_path, map_location=self.device)
             self.classifier.load_state_dict(state_dict)

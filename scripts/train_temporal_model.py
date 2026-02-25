@@ -199,10 +199,19 @@ class CremaTemporalDataset(Dataset):
     """
     Load temporal sequences from .pkl: visual_latent (15, 384), audio_latent (15, 768),
     geometric (15, 5) = concat(visual_fau (15,3), audio_geometric (15,2)).
+    Supports preload=True to load all .pkl files into RAM (avoids macOS iCloud/SSD timeout).
     """
 
-    def __init__(self, paths: List[Path]) -> None:
+    def __init__(self, paths: List[Path], preload: bool = True) -> None:
         self.paths = paths
+        self.preload = preload
+        self.data_cache: List[object] = []
+        if preload:
+            print("[CremaTemporalDataset] Preloading .pkl files into RAM...")
+            for path in tqdm(paths, desc="Loading features into RAM", unit="file"):
+                with open(path, "rb") as f:
+                    self.data_cache.append(pickle.load(f))
+            print(f"[CremaTemporalDataset] Preloaded {len(self.data_cache)} samples.")
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -210,10 +219,13 @@ class CremaTemporalDataset(Dataset):
     def __getitem__(
         self, idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        path = self.paths[idx]
-        stem = path.stem
-        with open(path, "rb") as f:
-            feat = pickle.load(f)
+        stem = self.paths[idx].stem
+        if self.preload:
+            feat = self.data_cache[idx]
+        else:
+            path = self.paths[idx]
+            with open(path, "rb") as f:
+                feat = pickle.load(f)
 
         # visual_latent: (15, 384)
         v = feat.get("visual_latent")

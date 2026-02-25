@@ -245,7 +245,7 @@ def train(
             loss.backward()
             optimizer.step()
 
-            epoch_loss += float(loss.item()) * x.size(0)
+            epoch_loss += float(loss.item()) * y.size(0)
 
             preds = torch.argmax(logits, dim=-1)
             correct += int((preds == y).sum().item())
